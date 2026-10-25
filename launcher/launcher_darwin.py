@@ -992,6 +992,13 @@ class Launcher:
         env = game_env()
         env.update(SSBU_ROMFS=os.path.join(ROOT, 'targets', 'romfs'), SSBU_USERDATA=user, SSBU_SHOW='1', SSBU_VOLUME='100',
                    SSBU_FOCUS_NOTIFY='0')
+        cfg_dir = os.path.join(ROOT, 'config')
+        controllers_ini = os.path.join(cfg_dir, 'controllers.ini')
+        graphics_ini = os.path.join(cfg_dir, 'graphics.ini')
+        if os.path.isfile(controllers_ini):
+            env['SSBU_CONFIG'] = controllers_ini
+        if os.path.isfile(graphics_ini):
+            env['SSBU_GRAPHICS_CONFIG'] = graphics_ini
         fonts = os.path.join(ROOT, 'targets', 'sysdata', 'fonts')
         if os.path.isdir(fonts):
             env['SSBU_FONTS'] = fonts
