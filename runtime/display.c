@@ -180,8 +180,8 @@ static void precise_wait_until(LONGLONG target, HANDLE timer) {
 static DWORD WINAPI vblank_thread(LPVOID arg) {
     (void)arg;
 #ifndef _WIN32
-    /* [Recomps#1] Linux: no D3DKMT; the refresh clock is our own (a Linux vblank source: plan step 6) */
-    printf("display: no vblank source on Linux yet: the refresh clock stays our own clock%c", 10);
+    /* [Recomps#1] Darwin/Linux: no D3DKMT; the refresh clock is our own (a macOS/Cocoa vblank source: plan step 6) */
+    printf("display: no vblank source on Darwin yet: the refresh clock stays our own clock%c", 10);
     InterlockedExchange(&g_vb_state, -1);
     return 0;
 #else
@@ -469,14 +469,15 @@ static void window_close(void) {                            /* the exit request,
 
 static char g_title[96];
 
-static DWORD WINAPI window_thread(LPVOID arg) {
-    (void)arg;
+/* [Recomps#1] the window itself (SDL3): graphics.ini size / borderless / fullscreen, test copies hidden unless
+ * SSBU_SHOW=1, SSBU_TITLE names it. The caller has started SDL video: on Linux that is window_thread, on Darwin
+ * the main thread (notes/macos-port-plan.md step 4: the Cocoa driver wants video on the thread that started the
+ * process). */
+static void make_sdl_window(void) {
     const GfxOptions *go = gfx_options();
-    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
-    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { printf("display: SDL video could not start: %s\n", SDL_GetError()); fflush(stdout); _exit(1); }
     char exe[MAX_PATH] = "";
     GetModuleFileNameA(NULL, exe, sizeof exe);
-    const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *show = getenv("SSBU_SHOW");   /* GetModuleFileNameA: '\\' */
+    const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : strrchr(exe, '/') ? strrchr(exe, '/') + 1 : exe, *show = getenv("SSBU_SHOW");
     int visible = show ? atoi(show) != 0 : (!strcmp(base, "ssbu_native") || !strcmp(base, "ssbu_user") || !strcmp(base, "game_native"));
     snprintf(g_title, sizeof g_title, "%s", getenv("SSBU_TITLE") ? getenv("SSBU_TITLE") : "B2recomp");
     SDL_WindowFlags fl = SDL_WINDOW_VULKAN | (visible ? 0 : SDL_WINDOW_HIDDEN);
@@ -492,49 +493,64 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     SDL_Window *w = SDL_CreateWindow(g_title, cw, ch, fl);
     if (!w) { printf("display: SDL_CreateWindow failed: %s\n", SDL_GetError()); fflush(stdout); _exit(1); }
     g_hwnd = (HWND)w;
-    InterlockedExchange(&g_ready, 1);
-    float fx = 0, fy = 0;                                   /* fractions of a count the mouse moved (SDL3 reports float) */
-    for (;;) {
-        SDL_Event e;
-        if (SDL_WaitEventTimeout(&e, 10)) do {
-            switch (e.type) {
-            case SDL_EVENT_QUIT: case SDL_EVENT_WINDOW_CLOSE_REQUESTED: window_close(); break;
-            case SDL_EVENT_MOUSE_MOTION:
-                if (g_mouse_want && g_mouse_grab) {
-                    fx += e.motion.xrel; fy += e.motion.yrel;
-                    LONG dx = (LONG)fx, dy = (LONG)fy;
-                    fx -= (float)dx; fy -= (float)dy;
-                    if (dx) InterlockedAdd(&g_mdx, dx);
-                    if (dy) InterlockedAdd(&g_mdy, dy);
-                }
-                break;
-            case SDL_EVENT_MOUSE_BUTTON_DOWN:
-                if (g_mouse_want && !g_mouse_grab && (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS)) {
-                    g_mouse_grab = 1;
-                    InterlockedExchange(&g_mouse_hold, 1);
-                    mouse_update(w);
-                }
-                break;
-            case SDL_EVENT_KEY_DOWN:
-                if (e.key.key == SDLK_ESCAPE && g_mouse_grab && !fills_monitor(w)) { g_mouse_grab = 0; mouse_update(w); }
-                break;
-            case SDL_EVENT_WINDOW_FOCUS_GAINED: case SDL_EVENT_WINDOW_FOCUS_LOST: case SDL_EVENT_WINDOW_MINIMIZED:
-            case SDL_EVENT_WINDOW_RESTORED: case SDL_EVENT_WINDOW_RESIZED: case SDL_EVENT_WINDOW_MOVED:
-                mouse_update(w);
-                break;
-            default: break;
+}
+
+/* [Recomps#1] one pass of the window's SDL events (up to wait_ms for the first of them), then the posted requests
+ * (mouse capture, minimise / restore, title). Linux: window_thread loops over this, as before. Darwin: boot.c's
+ * main loop calls it instead - the Cocoa driver pumps events on the thread that started video, the main thread
+ * (notes/macos-port-plan.md step 4). */
+void display_pump_events(int wait_ms) {
+    SDL_Window *w = (SDL_Window *)g_hwnd;
+    if (!w) return;
+    static float fx, fy;                                    /* fractions of a count the mouse moved (SDL3 reports float) */
+    SDL_Event e;
+    if (SDL_WaitEventTimeout(&e, wait_ms)) do {
+        switch (e.type) {
+        case SDL_EVENT_QUIT: case SDL_EVENT_WINDOW_CLOSE_REQUESTED: window_close(); break;
+        case SDL_EVENT_MOUSE_MOTION:
+            if (g_mouse_want && g_mouse_grab) {
+                fx += e.motion.xrel; fy += e.motion.yrel;
+                LONG dx = (LONG)fx, dy = (LONG)fy;
+                fx -= (float)dx; fy -= (float)dy;
+                if (dx) InterlockedAdd(&g_mdx, dx);
+                if (dy) InterlockedAdd(&g_mdy, dy);
             }
-        } while (SDL_PollEvent(&e));
-        if (InterlockedExchange(&g_mouse_dirty, 0)) mouse_update(w);
-        { LONG sc = InterlockedExchange(&g_show_cmd, 0); if (sc == 1) SDL_MinimizeWindow(w); else if (sc == 2) SDL_RestoreWindow(w); }
-        if (InterlockedExchange(&g_title_dirty, 0)) {
-            char t[160];
-            AcquireSRWLockShared(&g_title_lock);
-            snprintf(t, sizeof t, "%s", g_title_want);
-            ReleaseSRWLockShared(&g_title_lock);
-            SDL_SetWindowTitle(w, t);
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            if (g_mouse_want && !g_mouse_grab && (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS)) {
+                g_mouse_grab = 1;
+                InterlockedExchange(&g_mouse_hold, 1);
+                mouse_update(w);
+            }
+            break;
+        case SDL_EVENT_KEY_DOWN:
+            if (e.key.key == SDLK_ESCAPE && g_mouse_grab && !fills_monitor(w)) { g_mouse_grab = 0; mouse_update(w); }
+            break;
+        case SDL_EVENT_WINDOW_FOCUS_GAINED: case SDL_EVENT_WINDOW_FOCUS_LOST: case SDL_EVENT_WINDOW_MINIMIZED:
+        case SDL_EVENT_WINDOW_RESTORED: case SDL_EVENT_WINDOW_RESIZED: case SDL_EVENT_WINDOW_MOVED:
+            mouse_update(w);
+            break;
+        default: break;
         }
+    } while (SDL_PollEvent(&e));
+    if (InterlockedExchange(&g_mouse_dirty, 0)) mouse_update(w);
+    { LONG sc = InterlockedExchange(&g_show_cmd, 0); if (sc == 1) SDL_MinimizeWindow(w); else if (sc == 2) SDL_RestoreWindow(w); }
+    if (InterlockedExchange(&g_title_dirty, 0)) {
+        char t[160];
+        AcquireSRWLockShared(&g_title_lock);
+        snprintf(t, sizeof t, "%s", g_title_want);
+        ReleaseSRWLockShared(&g_title_lock);
+        SDL_SetWindowTitle(w, t);
     }
+}
+
+static DWORD WINAPI window_thread(LPVOID arg) {
+    (void)arg;
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { printf("display: SDL video could not start: %s\n", SDL_GetError()); fflush(stdout); _exit(1); }
+    make_sdl_window();
+    InterlockedExchange(&g_ready, 1);
+    for (;;) display_pump_events(10);
     return 0;
 }
 
@@ -801,13 +817,25 @@ void display_init(void) {
      * SSBU_TIMER_PERIOD=<ms> (default 1; 0 = leave the system default). */
     { const char *e = getenv("SSBU_TIMER_PERIOD"); int ms = e ? atoi(e) : 1; if (ms > 0) { MMRESULT r = timeBeginPeriod((UINT)ms); printf("display: system timer period %d ms requested (%s)%c", ms, r == TIMERR_NOERROR ? "ok" : "refused", 10); } }
     hitch_init();
+#ifdef __APPLE__
+    /* [Recomps#1] macOS (notes/macos-port-plan.md step 4): SDL's Cocoa driver starts video and pumps events on the
+     * thread that began the process. display_init runs on that main thread, so the window is made HERE and boot.c's
+     * main loop pumps its events (display_pump_events); window_thread is not used. Everything below - the renderer
+     * (nvn_gl.c's render thread and its job events), the pacing threads - starts exactly as on Linux: the game's
+     * first nvn call lands in it. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { printf("display: SDL video could not start: %s\n", SDL_GetError()); fflush(stdout); _exit(1); }
+    make_sdl_window();
+    InterlockedExchange(&g_ready, 1);
+#else
     CreateThread(NULL, 0, window_thread, NULL, 0, NULL);
     while (!g_ready) Sleep(1);
+#endif
     nvn_gl_start(g_hwnd);
     speed_init();
     if (!g_lockstep && !old_pacing()) CreateThread(NULL, 0, vblank_thread, NULL, 0, NULL);      /* session 14: the display's vblanks, timed */
     if (!g_lockstep) CreateThread(NULL, 0, vsync_thread, NULL, 0, NULL);
-    { void nvn_vk_selftest_hook(void); nvn_vk_selftest_hook(); }      /* nvn_vk.c: SSBU_RENDERER=vk SSBU_VK_SELFTEST=<frames>, then exit (plan\phases\V1_vulkan.md, M1) */
+    { void nvn_vk_selftest_hook(void); nvn_vk_selftest_hook(); }
 }
 
 /* Called after every presented frame (nvn_gl.c has already put it in the window): holds the caller to 60 Hz. */
