@@ -5,6 +5,13 @@
 #include <string.h>
 #include <windows.h>
 #include <math.h>
+#ifndef _WIN32
+#include <SDL3/SDL.h>            /* [Recomps#1] Linux/Darwin: the window is SDL3 (the later branch of this file);
+                                 * the vblank thread asks it where the window is (Darwin's CVDisplayLink below) */
+#ifdef __APPLE__
+#include <CoreVideo/CVDisplayLink.h>   /* [Recomps#1] Darwin: the vblank source (vblank_thread): D3DKMT's counterpart */
+#endif
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 #include "gfx_options.h"
@@ -177,13 +184,99 @@ static void precise_wait_until(LONGLONG target, HANDLE timer) {
     if (due.QuadPart < 0) { if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100); else Sleep((DWORD)(left * 1000 / g_freq.QuadPart)); }
     for (QueryPerformanceCounter(&now); now.QuadPart < target; QueryPerformanceCounter(&now)) YieldProcessor();
 }
+#ifdef __APPLE__
+/* [Recomps#1] Darwin: one refresh happened (the CVDisplayLink callback runs this on CoreVideo's thread). The same
+ * bookkeeping as the Windows vblank thread's loop: the first 24 intervals measure the period (their median), then
+ * every refresh counts (a gap of more than one period counts the refreshes it covered), slowly re-averages the
+ * period, publishes count and time, and wakes the pacing thread. */
+static CVDisplayLinkRef g_cvdlink;
+static void darwin_vblank_note(void) {
+    static LONGLONG first[24];
+    static int nfirst;
+    static LONGLONG prev;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    LONGLONG dt = prev ? now.QuadPart - prev : 0;
+    prev = now.QuadPart;
+    if (g_vb_state == 1) {                                /* the first 24 intervals: their median is the refresh period */
+        if (dt > 0 && dt < g_freq.QuadPart / 20) first[nfirst++] = dt;
+        if (nfirst == 24) {
+            for (int i = 1; i < 24; i++) { LONGLONG v = first[i]; int k = i; while (k > 0 && first[k - 1] > v) { first[k] = first[k - 1]; k--; } first[k] = v; }
+            AcquireSRWLockExclusive(&g_vb_lock);
+            g_vb_period = (double)(first[11] + first[12]) / 2.0;
+            ReleaseSRWLockExclusive(&g_vb_lock);
+            printf("display: CoreVideo display link: refresh measured %.3f Hz (median of 24 vblank intervals: %.3f ms, shortest %.3f, longest %.3f)%c",
+                   (double)g_freq.QuadPart / g_vb_period, g_vb_period * 1000.0 / (double)g_freq.QuadPart,
+                   (double)first[0] * 1000.0 / (double)g_freq.QuadPart, (double)first[23] * 1000.0 / (double)g_freq.QuadPart, 10);
+            InterlockedExchange(&g_vb_state, 2);
+        }
+    } else if (g_vb_state == 2) {
+        LONG64 steps = 1;
+        if (dt > 0) {
+            double r = (double)dt / g_vb_period;
+            steps = (LONG64)(r + 0.5);
+            if (steps < 1) steps = 1;
+            if (steps <= 4 && r / (double)steps > 0.9 && r / (double)steps < 1.1) g_vb_period += ((double)dt / (double)steps - g_vb_period) * 0.01;      /* slow average: the long-run period */
+        }
+        AcquireSRWLockExclusive(&g_vb_lock);
+        g_vb_count += steps;
+        g_vb_qpc = now.QuadPart;
+        ReleaseSRWLockExclusive(&g_vb_lock);
+        WakeAllConditionVariable(&g_vb_cv);
+    }
+}
+static CVReturn darwin_vblank_cb(CVDisplayLinkRef link, const CVTimeStamp *now, const CVTimeStamp *out, CVOptionFlags in, CVOptionFlags *outf, void *info) {
+    (void)link; (void)now; (void)out; (void)in; (void)outf; (void)info;
+    darwin_vblank_note();
+    return kCVReturnSuccess;
+}
+#endif
 static DWORD WINAPI vblank_thread(LPVOID arg) {
     (void)arg;
 #ifndef _WIN32
-    /* [Recomps#1] Darwin/Linux: no D3DKMT; the refresh clock is our own (a macOS/Cocoa vblank source: plan step 6) */
-    printf("display: no vblank source on Darwin yet: the refresh clock stays our own clock%c", 10);
+#ifdef __APPLE__
+    /* [Recomps#1] Darwin (notes/macos-port-plan.md step 6): CoreVideo's display link is the vblank source, the
+     * counterpart of D3DKMTWaitForVerticalBlankEvent above. It calls back on a thread of its own at every refresh
+     * of the display the window is on; darwin_vblank_note() does the Windows thread's bookkeeping (the median of
+     * the first 24 intervals is the refresh period, then every refresh publishes the count and its time and wakes
+     * the pacing thread), so the display lock (vsync = auto / display) paces the game to the panel: at present
+     * interval 2 (the cutscenes) each frame is on screen for exactly two refreshes. Without a source the pacing
+     * runs on our own 60.000 Hz clock, which drifts against the panel: frames then land on uneven refreshes
+     * (the judder of the first port's cutscenes) and the game's whole timeline wobbles - the audio with it. */
+    CGDirectDisplayID disp[4];
+    uint32_t nd = 0;
+    int x = 0, y = 0, ww = 0, wh = 0;
+    if (g_hwnd && SDL_GetWindowPosition((SDL_Window *)g_hwnd, &x, &y) && SDL_GetWindowSize((SDL_Window *)g_hwnd, &ww, &wh) && ww > 0 && wh > 0) {
+        CGRect wr = { { x, y }, { ww, wh } };
+        CGGetDisplaysWithRect(wr, 4, disp, &nd);
+        double best = 0;                                   /* the display the window covers most of (MonitorFromWindow) */
+        for (uint32_t i = 0; i < nd; i++) {
+            CGRect b = CGDisplayBounds(disp[i]);
+            double w = (double)(b.size.width > wr.size.width ? wr.size.width : b.size.width),
+                   h = (double)(b.size.height > wr.size.height ? wr.size.height : b.size.height);
+            if (w * h > best) { best = w * h; disp[0] = disp[i]; }
+        }
+        nd = best > 0 ? 1 : 0;
+    }
+    if (!nd) disp[nd++] = CGMainDisplayID();               /* no window area on a display: the main one */
+    CVDisplayLinkRef link = NULL;
+    if (CVDisplayLinkCreateWithCGDisplay(disp[0], &link) != kCVReturnSuccess || !link ||
+        CVDisplayLinkSetOutputCallback(link, darwin_vblank_cb, NULL) != kCVReturnSuccess ||
+        CVDisplayLinkStart(link) != kCVReturnSuccess) {
+        if (link) { CVDisplayLinkRelease(link); link = NULL; }
+        printf("display: CoreVideo's display link could not start: the refresh clock stays our own clock%c", 10);
+        InterlockedExchange(&g_vb_state, -1);
+        return 0;
+    }
+    g_cvdlink = link;
+    InterlockedExchange(&g_vb_state, 1);
+    printf("display: CoreVideo display link on (display 0x%x): measuring the refresh rate%c", (unsigned)disp[0], 10);
+    for (;;) Sleep(60000);                                 /* the callback thread does the work; this thread stays (the link runs until the process ends) */
+#else
+    printf("display: no vblank source on Linux: the refresh clock stays our own clock%c", 10);
     InterlockedExchange(&g_vb_state, -1);
     return 0;
+#endif
 #else
     HMODULE gdi = LoadLibraryA("gdi32.dll");
     LONG (WINAPI *open_adapter)(KmtOpenAdapterFromHdc *) = gdi ? (void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromHdc") : NULL;
